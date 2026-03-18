@@ -1,0 +1,817 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MotoRush - Bike Game</title>
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+body { background:#000; display:flex; align-items:center; justify-content:center; height:100vh; overflow:hidden; font-family: Arial, sans-serif; }
+canvas { border:2px solid #f0c040; display:block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+// ─────────────────────────────────────────
+//  WEB AUDIO SOUNDS
+// ─────────────────────────────────────────
+var AC = null;
+var engineNode = null, engineGain = null;
+var engineStarted = false;
+
+function initAudio() {
+  if (AC) return;
+  try {
+    AC = new (window.AudioContext || window.webkitAudioContext)();
+  } catch(e) { AC = null; }
+}
+
+// Continuous engine rumble (oscillator with periodic noise)
+function startEngine() {
+  if (!AC || engineStarted) return;
+  engineStarted = true;
+
+  engineGain = AC.createGain();
+  engineGain.gain.value = 0.0;
+  engineGain.connect(AC.destination);
+
+  // Two detuned sawtooth oscillators for a gritty engine sound
+  engineNode = AC.createOscillator();
+  engineNode.type = 'sawtooth';
+  engineNode.frequency.value = 55;
+
+  var dist = AC.createWaveShaper();
+  var curve = new Float32Array(256);
+  for (var i=0; i<256; i++) {
+    var x = (i*2/256)-1;
+    curve[i] = (Math.PI + 300) * x / (Math.PI + 300 * Math.abs(x));
+  }
+  dist.curve = curve;
+
+  var lp = AC.createBiquadFilter();
+  lp.type = 'lowpass';
+  lp.frequency.value = 300;
+
+  engineNode.connect(dist);
+  dist.connect(lp);
+  lp.connect(engineGain);
+  engineNode.start();
+
+  // Ramp up
+  engineGain.gain.setTargetAtTime(0.18, AC.currentTime, 0.3);
+}
+
+function stopEngine() {
+  if (!AC || !engineStarted) return;
+  engineGain.gain.setTargetAtTime(0, AC.currentTime, 0.2);
+  engineStarted = false;
+  setTimeout(function() {
+    try { engineNode.stop(); } catch(e){}
+    engineStarted = false;
+    engineNode = null;
+  }, 600);
+}
+
+// Revs engine pitch based on speed
+function revEngine(spd) {
+  if (!engineNode) return;
+  var freq = 45 + spd * 8;
+  engineNode.frequency.setTargetAtTime(freq, AC.currentTime, 0.1);
+  if (engineGain) engineGain.gain.setTargetAtTime(0.18, AC.currentTime, 0.05);
+}
+
+// Jump whoosh sound
+function playJump() {
+  if (!AC) return;
+  var osc = AC.createOscillator();
+  var g = AC.createGain();
+  osc.type = 'sine';
+  osc.frequency.setValueAtTime(200, AC.currentTime);
+  osc.frequency.exponentialRampToValueAtTime(80, AC.currentTime + 0.25);
+  g.gain.setValueAtTime(0.25, AC.currentTime);
+  g.gain.exponentialRampToValueAtTime(0.001, AC.currentTime + 0.25);
+  osc.connect(g); g.connect(AC.destination);
+  osc.start(); osc.stop(AC.currentTime + 0.25);
+}
+
+// Coin collect ding
+function playCoin() {
+  if (!AC) return;
+  var freqs = [880, 1100, 1320];
+  freqs.forEach(function(f, i) {
+    var osc = AC.createOscillator();
+    var g = AC.createGain();
+    osc.type = 'sine';
+    osc.frequency.value = f;
+    var t = AC.currentTime + i * 0.07;
+    g.gain.setValueAtTime(0.15, t);
+    g.gain.exponentialRampToValueAtTime(0.001, t + 0.18);
+    osc.connect(g); g.connect(AC.destination);
+    osc.start(t); osc.stop(t + 0.18);
+  });
+}
+
+// Crash explosion sound
+function playCrash() {
+  if (!AC) return;
+  // Noise burst
+  var bufSz = AC.sampleRate * 0.4;
+  var buf = AC.createBuffer(1, bufSz, AC.sampleRate);
+  var data = buf.getChannelData(0);
+  for (var i=0; i<bufSz; i++) data[i] = Math.random()*2-1;
+  var src = AC.createBufferSource();
+  src.buffer = buf;
+  var lp = AC.createBiquadFilter();
+  lp.type = 'lowpass'; lp.frequency.value = 600;
+  var g = AC.createGain();
+  g.gain.setValueAtTime(0.7, AC.currentTime);
+  g.gain.exponentialRampToValueAtTime(0.001, AC.currentTime + 0.4);
+  src.connect(lp); lp.connect(g); g.connect(AC.destination);
+  src.start(); src.stop(AC.currentTime + 0.4);
+  // Low thud
+  var osc = AC.createOscillator();
+  var og = AC.createGain();
+  osc.type = 'sine'; osc.frequency.value = 60;
+  og.gain.setValueAtTime(0.5, AC.currentTime);
+  og.gain.exponentialRampToValueAtTime(0.001, AC.currentTime + 0.3);
+  osc.connect(og); og.connect(AC.destination);
+  osc.start(); osc.stop(AC.currentTime + 0.3);
+}
+
+// Landing thud
+function playLand() {
+  if (!AC) return;
+  var osc = AC.createOscillator();
+  var g = AC.createGain();
+  osc.type = 'sine'; osc.frequency.value = 100;
+  osc.frequency.exponentialRampToValueAtTime(40, AC.currentTime + 0.1);
+  g.gain.setValueAtTime(0.2, AC.currentTime);
+  g.gain.exponentialRampToValueAtTime(0.001, AC.currentTime + 0.1);
+  osc.connect(g); g.connect(AC.destination);
+  osc.start(); osc.stop(AC.currentTime + 0.1);
+}
+
+// ─────────────────────────────────────────
+//  CANVAS SETUP
+// ─────────────────────────────────────────
+var canvas = document.getElementById('c');
+var ctx = canvas.getContext('2d');
+var CW = 600, CH = 400;
+canvas.width = CW; canvas.height = CH;
+
+function resize() {
+  var s = Math.min(window.innerWidth/CW, window.innerHeight/CH) * 0.95;
+  canvas.style.width = (CW*s)+'px';
+  canvas.style.height = (CH*s)+'px';
+}
+resize();
+window.addEventListener('resize', resize);
+
+// ─────────────────────────────────────────
+//  LANE SYSTEM  (3 horizontal lanes)
+//  Bike can be in lane 0,1,2
+//  Obstacles and coins are lane-stamped
+// ─────────────────────────────────────────
+var LANE_XS = [100, 300, 500]; // X centres of 3 lanes
+var GROUND_Y = 300;            // Y where bike sits
+
+// ─────────────────────────────────────────
+//  GAME STATE
+// ─────────────────────────────────────────
+var STATE = 'MENU';
+var mode  = 'endless';
+var score = 0, speed = 5, frameN = 0, timeLeft = 30, roadX = 0;
+
+// ── HIGHSCORES — saved to localStorage per mode ──
+var highscores = {
+  endless: parseInt(localStorage.getItem('motorush_hs_endless')||'0'),
+  timer:   parseInt(localStorage.getItem('motorush_hs_timer')||'0')
+};
+var best = 0; // best score this session (shown in HUD)
+
+var bikeLane = 1;         // 0,1,2
+var bikeTargetLane = 1;
+var bikeX = LANE_XS[1];
+var bikeY = GROUND_Y;
+var bikeVY = 0;
+var bikeOnGround = true;
+var wasOnGround = true;
+
+var obstacles = [];
+var coins     = [];
+
+// Track which lane has an obstacle near the spawn edge
+// so coins never land on them
+function laneBlockedAt(lane, xStart, xEnd) {
+  for (var i=0; i<obstacles.length; i++) {
+    var o = obstacles[i];
+    if (o.lane === lane && o.x > xStart && o.x < xEnd) return true;
+  }
+  return false;
+}
+
+// ─────────────────────────────────────────
+//  INPUT
+// ─────────────────────────────────────────
+document.addEventListener('keydown', function(e) {
+  initAudio();
+  if (STATE === 'PLAYING') {
+    if ((e.key===' '||e.key==='ArrowUp') && bikeOnGround) jump();
+    if ((e.key==='ArrowLeft'||e.key==='a') && bikeTargetLane > 0) bikeTargetLane--;
+    if ((e.key==='ArrowRight'||e.key==='d') && bikeTargetLane < 2) bikeTargetLane++;
+  }
+  e.preventDefault();
+});
+
+canvas.addEventListener('click', function(e) {
+  initAudio();
+  var rect = canvas.getBoundingClientRect();
+  var sx = (e.clientX-rect.left)*(CW/rect.width);
+  var sy = (e.clientY-rect.top)*(CH/rect.height);
+
+  if (STATE==='MENU') {
+    if (sx>130&&sx<300&&sy>220&&sy<270){ startGame('endless'); return; }
+    if (sx>320&&sx<490&&sy>220&&sy<270){ startGame('timer');   return; }
+  }
+  if (STATE==='PLAYING') {
+    // Top half = jump, bottom-left = left, bottom-right = right
+    if (sy < CH*0.55) { if(bikeOnGround) jump(); }
+    else if (sx < CW/2) { if(bikeTargetLane>0) bikeTargetLane--; }
+    else                { if(bikeTargetLane<2) bikeTargetLane++; }
+  }
+  if (STATE==='DEAD') {
+    if (sx>150&&sx<290&&sy>275&&sy<325){ startGame(mode); return; }
+    if (sx>320&&sx<460&&sy>275&&sy<325){ STATE='MENU'; stopEngine(); return; }
+  }
+});
+
+function jump() {
+  bikeVY = -14; bikeOnGround = false;
+  playJump();
+  if (engineGain) engineGain.gain.setTargetAtTime(0.08, AC.currentTime, 0.05);
+}
+
+// ─────────────────────────────────────────
+//  START / RESET
+// ─────────────────────────────────────────
+function startGame(m) {
+  mode = m; STATE = 'PLAYING';
+  score=0; speed=5; frameN=0; timeLeft=30; roadX=0;
+  bikeLane=1; bikeTargetLane=1;
+  bikeX=LANE_XS[1]; bikeY=GROUND_Y; bikeVY=0; bikeOnGround=true; wasOnGround=true;
+  obstacles=[]; coins=[];
+  startEngine();
+}
+
+function endGame() {
+  if (score>best) best=score;
+  // Save highscore to localStorage
+  if (score > highscores[mode]) {
+    highscores[mode] = score;
+    localStorage.setItem('motorush_hs_'+mode, score);
+  }
+  STATE='DEAD';
+  playCrash();
+  stopEngine();
+}
+
+// ─────────────────────────────────────────
+//  MAIN LOOP
+// ─────────────────────────────────────────
+var lastTime=0;
+function loop(ts) {
+  var dt = Math.min((ts-lastTime)/16.67, 3);
+  lastTime = ts;
+  update(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+// ─────────────────────────────────────────
+//  UPDATE
+// ─────────────────────────────────────────
+function update(dt) {
+  if (STATE!=='PLAYING') return;
+
+  frameN++;
+  speed = 5 + frameN*0.004;
+  score += Math.floor(speed*0.4);
+  roadX -= speed*dt;
+  if (roadX < -60) roadX += 60;
+
+  // Rev engine pitch with speed
+  revEngine(speed);
+
+  // Timer
+  if (mode==='timer') {
+    timeLeft -= dt/60;
+    if (timeLeft<=0) { timeLeft=0; endGame(); return; }
+  }
+
+  // Smooth lane switching
+  var tx = LANE_XS[bikeTargetLane];
+  bikeX += (tx - bikeX) * 0.18 * dt;
+  if (Math.abs(bikeX-tx)<1) { bikeX=tx; bikeLane=bikeTargetLane; }
+
+  // Gravity
+  wasOnGround = bikeOnGround;
+  if (!bikeOnGround) {
+    bikeVY += 0.7*dt;
+    bikeY  += bikeVY*dt;
+    if (bikeY >= GROUND_Y) {
+      bikeY=GROUND_Y; bikeVY=0; bikeOnGround=true;
+      if (!wasOnGround) playLand();
+    }
+  }
+
+  // ── SPAWN OBSTACLES ──
+  // Stagger: pick a random lane that doesn't already have an obstacle near front
+  var spawnEvery = Math.max(48, 100 - Math.floor(speed*3));
+  if (frameN % spawnEvery === 0) {
+    // pick a lane randomly, prefer lanes without recent obstacle
+    var laneOrder = shuffle([0,1,2]);
+    var spawnLane = laneOrder[0]; // just pick first shuffled
+    var types = ['rock','barrel','cone'];
+    obstacles.push({
+      lane: spawnLane,
+      x: CW + 50,
+      y: GROUND_Y + 8,
+      type: types[Math.floor(Math.random()*types.length)],
+      w:36, h:36
+    });
+  }
+
+  // ── SPAWN COINS ──
+  // Coins spawn every 70 frames but ONLY in lanes that have NO obstacle
+  // within the upcoming 300px window, and NOT at ground-level if there's
+  // an obstacle on that lane anywhere near x=CW
+  if (frameN % 70 === 0) {
+    // Build list of safe lanes + positions
+    var safeLanes = [];
+    for (var ln=0; ln<3; ln++) {
+      // Check: no obstacle within 200px of spawn zone on this lane
+      var blocked = false;
+      for (var oi=0; oi<obstacles.length; oi++) {
+        var ob = obstacles[oi];
+        if (ob.lane===ln && ob.x > CW-50 && ob.x < CW+300) { blocked=true; break; }
+      }
+      if (!blocked) safeLanes.push(ln);
+    }
+
+    if (safeLanes.length > 0) {
+      var coinLane = safeLanes[Math.floor(Math.random()*safeLanes.length)];
+      // coin can be on ground (easy grab) or in air (need jump)
+      var airCoin = Math.random() > 0.45;
+      var coinY   = airCoin ? GROUND_Y - 70 : GROUND_Y + 8;
+      // If ground coin, double-check no obstacle at same lane near spawn
+      if (!airCoin) {
+        for (var oi=0; oi<obstacles.length; oi++) {
+          var ob = obstacles[oi];
+          if (ob.lane===coinLane && ob.x>CW-20 && ob.x<CW+80) { coinY = GROUND_Y-70; break; }
+        }
+      }
+      coins.push({ lane:coinLane, x:LANE_XS[coinLane], y:coinY, taken:false, popAge:0, bob:0 });
+    }
+  }
+
+  // ── MOVE OBSTACLES + COLLISION ──
+  for (var i=obstacles.length-1; i>=0; i--) {
+    var o = obstacles[i];
+    o.x -= speed*dt;
+    if (o.x < -80) { obstacles.splice(i,1); continue; }
+    // Collision with bike
+    if (Math.abs(o.x - bikeX) < 28 && bikeY+20 > o.y-o.h/2) {
+      endGame(); return;
+    }
+  }
+
+  // ── MOVE COINS + COLLECT ──
+  for (var i=coins.length-1; i>=0; i--) {
+    var c = coins[i];
+    c.bob = Math.sin(frameN*0.1)*5;
+    if (!c.taken) {
+      c.x -= speed*dt;
+    } else {
+      c.popAge++;
+      if (c.popAge > 28) { coins.splice(i,1); continue; }
+    }
+    if (c.x < -40 && !c.taken) { coins.splice(i,1); continue; }
+    // Collect check
+    if (!c.taken && Math.abs(c.x-bikeX)<26 && Math.abs((c.y+c.bob)-bikeY)<30) {
+      c.taken = true;
+      score += 100;
+      if (mode==='timer') timeLeft = Math.min(30, timeLeft+3);
+      playCoin();
+    }
+  }
+}
+
+function shuffle(arr) {
+  var a = arr.slice();
+  for (var i=a.length-1;i>0;i--) { var j=Math.floor(Math.random()*(i+1)); var t=a[i];a[i]=a[j];a[j]=t; }
+  return a;
+}
+
+// ─────────────────────────────────────────
+//  DRAW
+// ─────────────────────────────────────────
+function draw() {
+  ctx.clearRect(0,0,CW,CH);
+  if (STATE==='MENU')            drawMenu();
+  else if (STATE==='PLAYING')    drawGame();
+  else if (STATE==='DEAD')     { drawGame(); drawOverlay(); }
+}
+
+// ── MENU ──
+function drawMenu() {
+  var sky = ctx.createLinearGradient(0,0,0,CH);
+  sky.addColorStop(0,'#05050f'); sky.addColorStop(1,'#1a0530');
+  ctx.fillStyle=sky; ctx.fillRect(0,0,CW,CH);
+
+  // Road strip
+  ctx.fillStyle='#1a1a2e'; ctx.fillRect(0,310,CW,90);
+  ctx.strokeStyle='#f0c040'; ctx.lineWidth=2;
+  ctx.beginPath(); ctx.moveTo(0,310); ctx.lineTo(CW,310); ctx.stroke();
+
+  // Animated lane dashes on menu road
+  ctx.strokeStyle='#f0c04055'; ctx.lineWidth=3;
+  ctx.setLineDash([30,20]); ctx.lineDashOffset = -(Date.now()/30%50);
+  ctx.beginPath(); ctx.moveTo(0,345); ctx.lineTo(CW,345); ctx.stroke();
+  ctx.setLineDash([]);
+
+  // Title — outline style, no glow
+  ctx.font='bold 82px Arial Black'; ctx.textAlign='center';
+  // Dark fill so outline pops
+  ctx.fillStyle='#0a0018';
+  ctx.fillText('MOTORUSH', CW/2, 112);
+  // Thick yellow outline
+  ctx.strokeStyle='#f0c040'; ctx.lineWidth=4; ctx.lineJoin='round';
+  ctx.strokeText('MOTORUSH', CW/2, 112);
+  // Thin inner white edge for crispness
+  ctx.strokeStyle='rgba(255,255,220,0.35)'; ctx.lineWidth=1.5;
+  ctx.strokeText('MOTORUSH', CW/2, 112);
+
+  // Subtitle with letter spacing effect
+  ctx.fillStyle='#ff8844'; ctx.font='bold 15px Arial'; ctx.letterSpacing='4px';
+  ctx.fillText('O F F L I N E   B I K E   R A C I N G', CW/2, 146);
+  ctx.letterSpacing='0px';
+
+  // Bike on road
+  drawBikeAt(ctx, CW/2, 336, 1, Date.now()/300);
+
+  // Buttons
+  drawBtn(130,200,165,52,'#f0c040','#000','ENDLESS');
+  drawBtn(310,200,165,52,'#ff4520','#fff','TIMER 30s');
+
+  // ── HIGHSCORE PANEL ──
+  ctx.fillStyle='rgba(0,0,0,0.55)';
+  ctx.fillRect(170, 262, 260, 60);
+  ctx.strokeStyle='#f0c04055'; ctx.lineWidth=1; ctx.strokeRect(170,262,260,60);
+  // Trophy icon + label
+  ctx.fillStyle='#f0c040'; ctx.font='bold 13px Arial'; ctx.textAlign='center';
+  ctx.fillText('🏆  HIGHSCORES', CW/2, 280);
+  // Endless
+  ctx.fillStyle='#aaa'; ctx.font='12px Arial'; ctx.textAlign='left';
+  ctx.fillText('Endless:', 185, 300);
+  ctx.fillStyle='#f0c040'; ctx.font='bold 14px Arial Black';
+  ctx.fillText(highscores.endless, 255, 300);
+  // Timer
+  ctx.fillStyle='#aaa'; ctx.font='12px Arial';
+  ctx.fillText('Timer:', 310, 300);
+  ctx.fillStyle='#ff8844'; ctx.font='bold 14px Arial Black';
+  ctx.fillText(highscores.timer, 355, 300);
+
+  ctx.fillStyle='#444'; ctx.font='12px Arial'; ctx.textAlign='center';
+  ctx.fillText('Arrow keys / WASD to steer  |  Space / ↑ to jump  |  Tap on mobile', CW/2, 392);
+}
+
+function drawBtn(x,y,w,h,bg,fg,label) {
+  ctx.fillStyle=bg; ctx.fillRect(x,y,w,h);
+  ctx.strokeStyle='rgba(255,255,255,0.2)'; ctx.lineWidth=1.5; ctx.strokeRect(x,y,w,h);
+  ctx.fillStyle=fg; ctx.font='bold 22px Arial Black'; ctx.textAlign='center';
+  ctx.fillText(label, x+w/2, y+h/2+8);
+}
+
+// ── GAME SCREEN ──
+function drawGame() {
+  // Sky
+  var sky=ctx.createLinearGradient(0,0,0,CH);
+  sky.addColorStop(0,'#05050f'); sky.addColorStop(1,'#1a0530');
+  ctx.fillStyle=sky; ctx.fillRect(0,0,CW,CH);
+
+  // Stars
+  ctx.fillStyle='#fff';
+  [[50,28],[130,55],[210,18],[330,42],[430,22],[515,52],[570,14],[85,75],[360,68],[470,38],[250,60],[155,35]].forEach(function(s){
+    ctx.beginPath(); ctx.arc(s[0],s[1],1.4,0,Math.PI*2); ctx.fill();
+  });
+
+  // Moon
+  ctx.fillStyle='#f8e8a0'; ctx.shadowColor='#f8e8a080'; ctx.shadowBlur=20;
+  ctx.beginPath(); ctx.arc(545,48,24,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle='#1a0530'; ctx.shadowBlur=0;
+  ctx.beginPath(); ctx.arc(557,42,19,0,Math.PI*2); ctx.fill();
+
+  // Road base
+  ctx.fillStyle='#111120'; ctx.fillRect(0,320,CW,80);
+  // Horizon glow
+  ctx.fillStyle='rgba(100,50,200,0.28)'; ctx.fillRect(0,316,CW,8);
+  // Horizon line
+  ctx.strokeStyle='#f0c040'; ctx.lineWidth=2;
+  ctx.beginPath(); ctx.moveTo(0,320); ctx.lineTo(CW,320); ctx.stroke();
+  // Road edges
+  ctx.strokeStyle='#f0c04066'; ctx.lineWidth=2;
+  ctx.beginPath(); ctx.moveTo(18,320); ctx.lineTo(18,CH); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(CW-18,320); ctx.lineTo(CW-18,CH); ctx.stroke();
+  // Lane dividers (animated)
+  ctx.strokeStyle='#f0c04044'; ctx.lineWidth=2;
+  ctx.setLineDash([28,22]); ctx.lineDashOffset=roadX;
+  [200,400].forEach(function(lx){
+    ctx.beginPath(); ctx.moveTo(lx,320); ctx.lineTo(lx,CH); ctx.stroke();
+  });
+  ctx.setLineDash([]);
+
+  // ── COINS ──
+  for (var i=0;i<coins.length;i++) {
+    var c=coins[i];
+    if (c.taken) {
+      ctx.globalAlpha=Math.max(0,1-c.popAge/20);
+      ctx.fillStyle='#f0c040'; ctx.font='bold 16px Arial Black'; ctx.textAlign='center';
+      ctx.fillText('+100', c.x, c.y-18-c.popAge*0.8);
+      ctx.globalAlpha=1;
+    } else {
+      var cy = c.y + c.bob;
+      ctx.save();
+      ctx.shadowColor='#f0c040'; ctx.shadowBlur=18;
+      ctx.fillStyle='#f0c040';
+      ctx.beginPath(); ctx.arc(c.x,cy,13,0,Math.PI*2); ctx.fill();
+      ctx.shadowBlur=0;
+      ctx.fillStyle='#7a5800'; ctx.font='bold 13px Arial'; ctx.textAlign='center';
+      ctx.fillText('$',c.x,cy+5);
+      // sparkle
+      if (frameN%20<10) {
+        ctx.strokeStyle='#ffe580'; ctx.lineWidth=1.5;
+        [[0,-18],[13,-13],[18,0],[13,13]].forEach(function(d){
+          ctx.beginPath(); ctx.moveTo(c.x+d[0]*0.55,cy+d[1]*0.55);
+          ctx.lineTo(c.x+d[0],cy+d[1]); ctx.stroke();
+        });
+      }
+      ctx.restore();
+    }
+  }
+
+  // ── OBSTACLES ──
+  for (var i=0;i<obstacles.length;i++) drawObstacle(obstacles[i]);
+
+  // ── BIKE ──
+  var bikeBob = bikeOnGround ? Math.sin(frameN*0.25)*1.5 : 0;
+  drawBikeAt(ctx, bikeX, bikeY+bikeBob, 1, frameN*0.12);
+
+  // ── HUD ──
+  // Score
+  ctx.fillStyle='rgba(0,0,0,0.72)'; ctx.fillRect(8,8,155,68);
+  ctx.strokeStyle='#333'; ctx.lineWidth=1; ctx.strokeRect(8,8,155,68);
+  ctx.fillStyle='#888'; ctx.font='11px Arial'; ctx.textAlign='left'; ctx.fillText('SCORE',20,26);
+  ctx.fillStyle='#f0c040'; ctx.font='bold 30px Arial Black'; ctx.fillText(score,20,65);
+
+  // Best
+  ctx.fillStyle='rgba(0,0,0,0.72)'; ctx.fillRect(CW-163,8,155,68);
+  ctx.strokeStyle='#333'; ctx.lineWidth=1; ctx.strokeRect(CW-163,8,155,68);
+  ctx.fillStyle='#888'; ctx.font='11px Arial'; ctx.textAlign='right'; ctx.fillText('BEST',CW-20,26);
+  ctx.fillStyle='#f0c040'; ctx.font='bold 30px Arial Black'; ctx.textAlign='right'; ctx.fillText(best,CW-20,65);
+
+  // Timer (only timer mode)
+  if (mode==='timer') {
+    ctx.fillStyle='rgba(0,0,0,0.72)'; ctx.fillRect(CW/2-90,8,180,68);
+    ctx.strokeStyle='#333'; ctx.lineWidth=1; ctx.strokeRect(CW/2-90,8,180,68);
+    ctx.fillStyle='#888'; ctx.font='11px Arial'; ctx.textAlign='center'; ctx.fillText('TIME LEFT',CW/2,26);
+    ctx.fillStyle=timeLeft<10?'#ff4520':'#f0c040';
+    ctx.font='bold 30px Arial Black'; ctx.textAlign='center';
+    ctx.fillText(Math.ceil(timeLeft)+'s',CW/2,65);
+    ctx.fillStyle='#333'; ctx.fillRect(CW/2-78,70,156,5);
+    ctx.fillStyle=timeLeft<10?'#ff4520':'#f0c040';
+    ctx.fillRect(CW/2-78,70,156*(timeLeft/30),5);
+  }
+
+  // Speed indicator (small bar bottom-right)
+  ctx.fillStyle='#111'; ctx.fillRect(CW-90,CH-22,80,10);
+  ctx.fillStyle='#ff8800';
+  ctx.fillRect(CW-90,CH-22,Math.min(80,(speed-5)*6),10);
+  ctx.fillStyle='#888'; ctx.font='10px Arial'; ctx.textAlign='right';
+  ctx.fillText('SPEED',CW-92,CH-13);
+
+  // Lane guide dots at bottom
+  for (var ln=0;ln<3;ln++) {
+    ctx.beginPath(); ctx.arc(LANE_XS[ln],CH-10,5,0,Math.PI*2);
+    ctx.fillStyle = ln===bikeTargetLane ? '#f0c040' : '#333';
+    ctx.fill();
+  }
+
+  ctx.fillStyle='#444'; ctx.font='11px Arial'; ctx.textAlign='center';
+  ctx.fillText(mode==='endless'?'ENDLESS MODE':'TIMER MODE — collect coins for +3s!', CW/2, CH-22);
+}
+
+// ── GAME OVER OVERLAY ──
+function drawOverlay() {
+  ctx.fillStyle='rgba(0,0,0,0.82)'; ctx.fillRect(0,0,CW,CH);
+  var title = mode==='timer' ? "TIME'S UP!" : 'CRASH!';
+  ctx.shadowColor='#ff4520'; ctx.shadowBlur=30;
+  ctx.fillStyle='#ff4520'; ctx.font='bold 68px Arial Black'; ctx.textAlign='center';
+  ctx.fillText(title, CW/2, 118); ctx.shadowBlur=0;
+
+  // Score row
+  ctx.fillStyle='#aaa'; ctx.font='20px Arial';
+  ctx.fillText('Score', CW/2, 158);
+  ctx.fillStyle='#fff'; ctx.font='bold 32px Arial Black';
+  ctx.fillText(score, CW/2, 192);
+
+  // Highscore row — highlight if new record
+  var isNewRecord = score > 0 && score >= highscores[mode];
+  ctx.fillStyle='rgba(0,0,0,0.4)'; ctx.fillRect(CW/2-160, 202, 320, 56);
+  ctx.strokeStyle = isNewRecord ? '#f0c040' : '#333';
+  ctx.lineWidth=1.5; ctx.strokeRect(CW/2-160, 202, 320, 56);
+
+  if (isNewRecord) {
+    // Flash "NEW RECORD!" text
+    if (Math.floor(Date.now()/400)%2===0) {
+      ctx.fillStyle='#f0c040'; ctx.font='bold 13px Arial Black';
+      ctx.fillText('★  NEW RECORD!  ★', CW/2, 220);
+    }
+    ctx.fillStyle='#f0c040'; ctx.font='bold 26px Arial Black';
+    ctx.fillText(highscores[mode], CW/2, 248);
+  } else {
+    ctx.fillStyle='#888'; ctx.font='12px Arial';
+    ctx.fillText('HIGHSCORE  ('+mode+')', CW/2, 220);
+    ctx.fillStyle='#f0c040'; ctx.font='bold 26px Arial Black';
+    ctx.fillText(highscores[mode], CW/2, 248);
+  }
+
+  drawBtn(150,272,140,50,'#f0c040','#000','RETRY');
+  drawBtn(320,272,140,50,'#ff4520','#fff','MENU');
+}
+
+// ─────────────────────────────────────────
+//  DRAW BIKE
+// ─────────────────────────────────────────
+function drawBikeAt(c, x, y, sc, wheelRot) {
+  c.save();
+  c.translate(x, y);
+  c.scale(sc, sc);
+  var wr = wheelRot||0;
+
+  // Shadow
+  c.fillStyle='rgba(0,0,0,0.28)';
+  c.beginPath(); c.ellipse(0,44,46,9,0,0,Math.PI*2); c.fill();
+
+  // Exhaust
+  c.strokeStyle='#666'; c.lineWidth=5; c.lineCap='round';
+  c.beginPath(); c.moveTo(-14,14); c.quadraticCurveTo(-36,22,-56,20); c.stroke();
+  c.strokeStyle='#444'; c.lineWidth=2;
+  c.beginPath(); c.moveTo(-56,20); c.quadraticCurveTo(-64,18,-60,12); c.stroke();
+
+  // Wheels
+  drawWheel(c,-30,30,22,wr);
+  drawWheel(c, 32,30,22,wr);
+
+  // Frame
+  c.strokeStyle='#dd3300'; c.lineWidth=7; c.lineCap='round';
+  c.beginPath(); c.moveTo(-5,-14); c.lineTo(-18,20); c.stroke(); // down
+  c.beginPath(); c.moveTo(-5,-14); c.lineTo(-1,20);  c.stroke(); // seat tube
+  c.strokeStyle='#ffaa00'; c.lineWidth=5;
+  c.beginPath(); c.moveTo(-5,-14); c.lineTo(13,-15); c.stroke(); // top
+  c.beginPath(); c.moveTo(13,-15); c.lineTo(32,30);  c.stroke(); // fork
+  c.strokeStyle='#bb3300'; c.lineWidth=3;
+  c.beginPath(); c.moveTo(-1,20);  c.lineTo(-30,30); c.stroke(); // chainstay
+  c.beginPath(); c.moveTo(0,12);   c.lineTo(-30,30); c.stroke(); // swingarm
+
+  // Engine
+  c.fillStyle='#223344'; c.fillRect(-14,2,24,20);
+  c.strokeStyle='#445566'; c.lineWidth=1.5; c.strokeRect(-14,2,24,20);
+  c.strokeStyle='#1a2a3a'; c.lineWidth=1;
+  for(var fi=0;fi<4;fi++){c.beginPath();c.moveTo(-14,4+fi*4);c.lineTo(10,4+fi*4);c.stroke();}
+
+  // Fuel tank
+  c.fillStyle='#cc0022';
+  c.beginPath(); c.moveTo(-10,-22); c.lineTo(14,-22); c.lineTo(17,-8); c.lineTo(-8,-6); c.closePath(); c.fill();
+  c.strokeStyle='#ff3344'; c.lineWidth=1.5; c.stroke();
+  c.fillStyle='rgba(255,180,180,0.18)';
+  c.beginPath(); c.moveTo(-5,-20); c.lineTo(10,-20); c.lineTo(11,-13); c.lineTo(-3,-13); c.closePath(); c.fill();
+
+  // Seat
+  c.fillStyle='#1a1a1a';
+  c.beginPath(); c.moveTo(-18,-26); c.lineTo(5,-26); c.lineTo(7,-18); c.lineTo(-20,-18); c.closePath(); c.fill();
+  c.strokeStyle='#444'; c.lineWidth=1; c.stroke();
+
+  // Handlebar
+  c.strokeStyle='#aaa'; c.lineWidth=4; c.lineCap='round';
+  c.beginPath(); c.moveTo(12,-18); c.lineTo(23,-13); c.stroke();
+  c.beginPath(); c.moveTo(23,-13); c.lineTo(27,-23); c.stroke();
+  c.beginPath(); c.moveTo(23,-13); c.lineTo(27,-4);  c.stroke();
+  c.strokeStyle='#222'; c.lineWidth=7;
+  c.beginPath(); c.moveTo(25,-23); c.lineTo(30,-23); c.stroke();
+  c.beginPath(); c.moveTo(25,-4);  c.lineTo(30,-4);  c.stroke();
+
+  // Headlight
+  c.fillStyle='#ffffbb'; c.shadowColor='#ffff99'; c.shadowBlur=12;
+  c.beginPath(); c.ellipse(36,-2,7,10,0.3,0,Math.PI*2); c.fill();
+  c.shadowBlur=0;
+  c.fillStyle='rgba(255,255,180,0.09)';
+  c.beginPath(); c.moveTo(42,-2); c.lineTo(82,-18); c.lineTo(82,14); c.closePath(); c.fill();
+
+  // Tail light
+  c.fillStyle='#ff2200';
+  c.beginPath(); c.ellipse(-48,22,4,6,0,0,Math.PI*2); c.fill();
+
+  // ── RIDER ──
+  var rb=0;
+  // Boots
+  c.fillStyle='#111';
+  c.beginPath(); c.ellipse(-5,22,9,5,0.35,0,Math.PI*2); c.fill();
+  c.beginPath(); c.ellipse(6,20,9,5,-0.35,0,Math.PI*2); c.fill();
+  // Legs
+  c.strokeStyle='#334466'; c.lineWidth=10; c.lineCap='round';
+  c.beginPath(); c.moveTo(-3,-4); c.lineTo(-5,22); c.stroke();
+  c.beginPath(); c.moveTo(2,-4);  c.lineTo(6,20);  c.stroke();
+  // Jacket
+  c.fillStyle='#1144cc';
+  c.beginPath();
+  c.moveTo(-13,-5); c.lineTo(13,-9); c.lineTo(19,-23); c.lineTo(7,-27); c.lineTo(-2,-21); c.lineTo(-15,-19);
+  c.closePath(); c.fill();
+  c.strokeStyle='#2255dd'; c.lineWidth=1.5; c.stroke();
+  // Racing stripes
+  c.strokeStyle='#ff4400'; c.lineWidth=2.5;
+  c.beginPath(); c.moveTo(-10,-17); c.lineTo(11,-21); c.stroke();
+  c.beginPath(); c.moveTo(-10,-12); c.lineTo(9,-16);  c.stroke();
+  // Arm
+  c.strokeStyle='#1144cc'; c.lineWidth=9; c.lineCap='round';
+  c.beginPath(); c.moveTo(4,-19); c.quadraticCurveTo(17,-19,27,-13); c.stroke();
+  c.fillStyle='#111'; c.beginPath(); c.arc(27,-13,5,0,Math.PI*2); c.fill();
+  // Helmet
+  c.fillStyle='#ee2200';
+  c.beginPath(); c.arc(2,-33,16,Math.PI*0.05,Math.PI*1.1,true); c.closePath(); c.fill();
+  c.strokeStyle='#ff5533'; c.lineWidth=2; c.stroke();
+  // Visor
+  c.fillStyle='rgba(0,190,255,0.55)'; c.strokeStyle='#00ccff'; c.lineWidth=1.5;
+  c.beginPath(); c.arc(2,-33,16,Math.PI*0.45,Math.PI*0.96,false); c.lineTo(2,-22); c.closePath(); c.fill(); c.stroke();
+  // Stripe
+  c.strokeStyle='#fff'; c.lineWidth=2;
+  c.beginPath(); c.arc(2,-33,16,Math.PI*0.1,Math.PI*0.45,false); c.stroke();
+  // Face
+  c.fillStyle='#e8b080'; c.beginPath(); c.ellipse(12,-31,4,5,0.2,0,Math.PI*2); c.fill();
+
+  c.restore();
+}
+
+function drawWheel(c,wx,wy,r,rot) {
+  c.save(); c.translate(wx,wy);
+  c.fillStyle='#111'; c.beginPath(); c.arc(0,0,r,0,Math.PI*2); c.fill();
+  c.strokeStyle='#555'; c.lineWidth=5; c.beginPath(); c.arc(0,0,r,0,Math.PI*2); c.stroke();
+  c.strokeStyle='#888'; c.lineWidth=3; c.beginPath(); c.arc(0,0,r*0.62,0,Math.PI*2); c.stroke();
+  c.fillStyle='#ccc'; c.beginPath(); c.arc(0,0,5,0,Math.PI*2); c.fill();
+  c.save(); c.rotate(rot);
+  c.strokeStyle='#f0c040'; c.lineWidth=2;
+  for(var i=0;i<6;i++){ c.rotate(Math.PI/3); c.beginPath(); c.moveTo(0,0); c.lineTo(0,r*0.58); c.stroke(); }
+  c.restore();
+  c.restore();
+}
+
+// ─────────────────────────────────────────
+//  DRAW OBSTACLE
+// ─────────────────────────────────────────
+function drawObstacle(o) {
+  ctx.save(); ctx.translate(o.x, o.y);
+  if (o.type==='cone') {
+    ctx.fillStyle='#ff6600';
+    ctx.beginPath(); ctx.moveTo(0,-36); ctx.lineTo(18,10); ctx.lineTo(-18,10); ctx.closePath(); ctx.fill();
+    ctx.fillStyle='#fff'; ctx.fillRect(-18,-4,36,6);
+    ctx.fillStyle='#ff6600'; ctx.beginPath(); ctx.ellipse(0,10,20,6,0,0,Math.PI*2); ctx.fill();
+    ctx.strokeStyle='#cc4400'; ctx.lineWidth=1.5; ctx.stroke();
+    // reflection
+    ctx.fillStyle='rgba(255,200,150,0.2)';
+    ctx.beginPath(); ctx.moveTo(0,-36); ctx.lineTo(5,-10); ctx.lineTo(-5,-10); ctx.closePath(); ctx.fill();
+  } else if (o.type==='barrel') {
+    ctx.fillStyle='#bb3300';
+    ctx.beginPath(); ctx.ellipse(0,0,16,26,0,0,Math.PI*2); ctx.fill();
+    ctx.strokeStyle='#ff9900'; ctx.lineWidth=3;
+    [-14,-4,6,16].forEach(function(dy){ ctx.beginPath(); ctx.ellipse(0,dy,16,5,0,0,Math.PI*2); ctx.stroke(); });
+    ctx.fillStyle='#ffdd00'; ctx.font='bold 16px Arial'; ctx.textAlign='center';
+    ctx.fillText('⚠',0,6);
+    ctx.fillStyle='rgba(255,150,50,0.15)';
+    ctx.beginPath(); ctx.ellipse(-4,-8,6,14,0,0,Math.PI*2); ctx.fill();
+  } else if (o.type==='rock') {
+    ctx.fillStyle='#556677';
+    ctx.beginPath();
+    ctx.moveTo(-22,16); ctx.lineTo(-26,-6); ctx.lineTo(-12,-22); ctx.lineTo(10,-24);
+    ctx.lineTo(26,-12); ctx.lineTo(24,16); ctx.closePath(); ctx.fill();
+    ctx.strokeStyle='#778899'; ctx.lineWidth=2; ctx.stroke();
+    ctx.fillStyle='#6688aa';
+    ctx.beginPath(); ctx.moveTo(-12,-22); ctx.lineTo(10,-24); ctx.lineTo(8,-8); ctx.lineTo(-6,-6); ctx.closePath(); ctx.fill();
+    ctx.fillStyle='#334455';
+    ctx.beginPath(); ctx.moveTo(-22,16); ctx.lineTo(-6,2); ctx.lineTo(12,6); ctx.lineTo(24,16); ctx.closePath(); ctx.fill();
+  }
+  ctx.restore();
+}
+</script>
+</body>
+</html>
